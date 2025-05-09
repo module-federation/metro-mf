@@ -1,0 +1,6 @@
+{
+  "name": "e2e",
+  "scripts": {
+    "test": "maestro test ."
+  }
+}
