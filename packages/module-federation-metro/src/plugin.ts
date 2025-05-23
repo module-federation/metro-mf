@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import type { ConfigT } from "metro-config";
+import type { Resolution } from "metro-resolver";
 import generateManifest from "./generate-manifest";
 import createEnhanceMiddleware from "./enhance-middleware";
 import {
@@ -161,19 +162,15 @@ function getRemoteEntryModule(options: ModuleFederationConfigNormalized) {
   const exposes = options.exposes || {};
 
   const exposesString = Object.keys(exposes)
-    .map(
-      (key) =>
-        `"${key}": async () => {
-      const module = await import("../../${exposes[key]}");
+    .map((key) => {
+      const importName = path.relative(".", exposes[key]);
+      const importPath = `../../${importName}`;
 
-      const target = { ...module };
-
-      Object.defineProperty(target, "__esModule", { value: true, enumerable: false });
-
-      return target;
-    }
-    `
-    )
+      return `"${key}": async () => {
+          const module = await import("${importPath}");
+          return module;
+        }`;
+    })
     .join(",");
 
   return remoteEntryModule
@@ -182,6 +179,16 @@ function getRemoteEntryModule(options: ModuleFederationConfigNormalized) {
     .replaceAll("__EXPOSES_MAP__", `{${exposesString}}`)
     .replaceAll("__NAME__", `"${options.name}"`)
     .replaceAll("__SHARE_STRATEGY__", JSON.stringify(options.shareStrategy));
+}
+
+function getRemoteHMRSetupModule() {
+  const remoteHMRSetupTemplatePath = require.resolve("./runtime/remote-hmr.js");
+  let remoteHMRSetupModule = fs.readFileSync(
+    remoteHMRSetupTemplatePath,
+    "utf-8"
+  );
+
+  return remoteHMRSetupModule;
 }
 
 function createInitHostVirtualModule(
@@ -212,10 +219,21 @@ function createSharedVirtualModules(
   Object.keys(options.shared).forEach((name) => {
     const sharedModule = getSharedModule(name);
     const sharedFilePath = path.join(vmDirPath, "shared", `${name}.js`);
+    // needed for deep imports
+    fs.mkdirSync(path.dirname(sharedFilePath), { recursive: true });
     fs.writeFileSync(sharedFilePath, sharedModule, "utf-8");
     sharedModulesPaths[name] = sharedFilePath;
   });
   return sharedModulesPaths;
+}
+
+function replaceModule(from: RegExp, to: string) {
+  return (resolved: Resolution): Resolution => {
+    if (resolved.type === "sourceFile" && from.test(resolved.filePath)) {
+      return { type: "sourceFile", filePath: to };
+    }
+    return resolved;
+  };
 }
 
 function normalizeOptions(
@@ -280,11 +298,15 @@ function withModuleFederation(
     ? createInitHostVirtualModule(options, mfMetroPath)
     : null;
 
-  let remoteEntryPath: string | undefined;
+  let remoteEntryPath: string | undefined,
+    remoteHMRSetupPath: string | undefined;
+
   if (isRemote) {
-    const filename = options.filename ?? "remoteEntry.js";
-    remoteEntryPath = path.join(mfMetroPath, filename);
+    remoteEntryPath = path.join(mfMetroPath, options.filename);
     fs.writeFileSync(remoteEntryPath, getRemoteEntryModule(options));
+
+    remoteHMRSetupPath = path.join(mfMetroPath, "remote-hmr.js");
+    fs.writeFileSync(remoteHMRSetupPath, getRemoteHMRSetupModule());
   }
 
   const asyncRequireHostPath = path.resolve(
@@ -340,6 +362,11 @@ function withModuleFederation(
           return { type: "sourceFile", filePath: asyncRequireRemotePath };
         }
 
+        // virtual module: remote-hmr
+        if (moduleName === "mf:remote-hmr") {
+          return { type: "sourceFile", filePath: remoteHMRSetupPath as string };
+        }
+
         // virtual module: shared-registry
         if (moduleName === "mf:shared-registry") {
           return { type: "sourceFile", filePath: sharedRegistryPath };
@@ -375,6 +402,15 @@ function withModuleFederation(
         if (Object.keys(options.shared).includes(moduleName)) {
           const sharedPath = sharedModulesPaths[moduleName];
           return { type: "sourceFile", filePath: sharedPath };
+        }
+
+        // replace getDevServer module in remote with our own implementation
+        if (isRemote && moduleName.includes("getDevServer")) {
+          const res = context.resolveRequest(context, moduleName, platform);
+          const from =
+            /react-native\/Libraries\/Core\/Devtools\/getDevServer\.js$/;
+          const to = path.resolve(__dirname, "../getDevServer.js");
+          return replaceModule(from, to)(res);
         }
 
         return context.resolveRequest(context, moduleName, platform);
