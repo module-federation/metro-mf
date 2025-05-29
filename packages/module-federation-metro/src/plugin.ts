@@ -474,6 +474,10 @@ function withModuleFederation(
         manifestPath
       ),
     },
+    // @ts-ignore
+    extra: {
+      moduleFederation: federationOptions,
+    },
   };
 }
 
